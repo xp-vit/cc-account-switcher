@@ -631,6 +631,26 @@ function Invoke-PerformSwitch {
     Write-Host ""
 }
 
+function Invoke-InstallCompletion {
+    $completionScript = Join-Path $PSScriptRoot "ccswitch.completion.ps1"
+    if (-not (Test-Path $completionScript)) {
+        Write-Host "Error: ccswitch.completion.ps1 not found next to ccswitch.ps1" -ForegroundColor Red; exit 1
+    }
+    $line = ". `"$completionScript`""
+    $profile = $PROFILE
+    if (-not (Test-Path $profile)) {
+        New-Item -ItemType File -Force -Path $profile | Out-Null
+    }
+    $existing = Get-Content $profile -Raw -ErrorAction SilentlyContinue
+    if ($existing -and $existing.Contains($completionScript)) {
+        Write-Host "Completion already installed in $profile"
+        return
+    }
+    Add-Content -Path $profile -Value "`n# ccswitch tab completion`n$line"
+    Write-Host "Installed completion in $profile"
+    Write-Host "Restart PowerShell or run: $line"
+}
+
 function Show-Help {
     Write-Host "Multi-Account Switcher for Claude Code"
     Write-Host "Usage: ccswitch [COMMAND]"
@@ -643,6 +663,7 @@ function Show-Help {
     Write-Host "  --switch-best                   Switch to best account with 5h session capacity"
     Write-Host "  --switch                        Rotate to next account in sequence"
     Write-Host "  --switch-to <num|email>         Switch to specific account"
+    Write-Host "  --install-completion            Install tab completion into PowerShell profile"
     Write-Host "  --help                          Show this help message"
     Write-Host ""
     Write-Host "Examples:"
@@ -667,6 +688,7 @@ switch ($cmd) {
     "--switch-best"    { Invoke-SwitchBest }
     "--switch"         { Invoke-Switch }
     "--switch-to"      { Invoke-SwitchTo $id }
+    "--install-completion" { Invoke-InstallCompletion }
     "--help"           { Show-Help }
     ""                 { Show-Help }
     default            { Write-Host "Error: Unknown command '$cmd'" -ForegroundColor Red; Show-Help; exit 1 }
