@@ -50,7 +50,7 @@ is_running_in_container() {
 detect_platform() {
     case "$(uname -s)" in
         Darwin) echo "macos" ;;
-        Linux) 
+        Linux)
             if [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
                 echo "wsl"
             else
@@ -224,7 +224,7 @@ write_credentials() {
     local credentials="$1"
     local platform
     platform=$(detect_platform)
-    
+
     case "$platform" in
         macos)
             security add-generic-password -U -s "Claude Code-credentials" -a "$USER" -w "$credentials" 2>/dev/null
@@ -266,7 +266,7 @@ write_account_credentials() {
     local credentials="$3"
     local platform
     platform=$(detect_platform)
-    
+
     case "$platform" in
         macos)
             security add-generic-password -U -s "Claude Code-Account-${account_num}-${email}" -a "$USER" -w "$credentials" 2>/dev/null
