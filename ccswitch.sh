@@ -9,6 +9,18 @@ set -euo pipefail
 readonly BACKUP_DIR="$HOME/.claude-switch-backup"
 readonly SEQUENCE_FILE="$BACKUP_DIR/sequence.json"
 
+# ANSI colors (disabled when stdout is not a terminal)
+if [[ -t 1 ]]; then
+    readonly C_GREEN=$'\033[32m'
+    readonly C_YELLOW=$'\033[33m'
+    readonly C_RED=$'\033[31m'
+    readonly C_BOLD=$'\033[1m'
+    readonly C_DIM=$'\033[2m'
+    readonly C_RESET=$'\033[0m'
+else
+    readonly C_GREEN='' C_YELLOW='' C_RED='' C_BOLD='' C_DIM='' C_RESET=''
+fi
+
 # Container detection
 is_running_in_container() {
     # Check for Docker environment file
@@ -134,7 +146,7 @@ check_bash_version() {
 
 # Check dependencies
 check_dependencies() {
-    for cmd in jq; do
+    for cmd in jq curl; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             echo "Error: Required command '$cmd' not found"
             echo "Install with: apt install $cmd (Linux) or brew install $cmd (macOS)"
@@ -520,6 +532,458 @@ cmd_list() {
     ' "$SEQUENCE_FILE"
 }
 
+# Parse ISO 8601 timestamp to Unix epoch seconds
+parse_iso_to_epoch() {
+    local ts="$1"
+    case "$(detect_platform)" in
+        linux|wsl)
+            date -d "$ts" +%s 2>/dev/null || echo "0"
+            ;;
+        macos)
+            # Strip microseconds, normalize +HH:MM to +HHMM for BSD date
+            local ts_norm
+            ts_norm=$(echo "$ts" | sed 's/\.[0-9]*//' | sed 's/+\([0-9][0-9]\):\([0-9][0-9]\)$/+\1\2/')
+            date -jf "%Y-%m-%dT%H:%M:%S%z" "$ts_norm" +%s 2>/dev/null || echo "0"
+            ;;
+        *)
+            python3 -c "from datetime import datetime; print(int(datetime.fromisoformat('${ts}').timestamp()))" 2>/dev/null || echo "0"
+            ;;
+    esac
+}
+
+# Format seconds as human-readable time remaining
+format_time_remaining() {
+    local total_seconds="$1"
+    local days=$(( total_seconds / 86400 ))
+    local hours=$(( (total_seconds % 86400) / 3600 ))
+    local minutes=$(( (total_seconds % 3600) / 60 ))
+
+    local day_s="days" hour_s="hours" min_s="minutes"
+    [[ $days -eq 1 ]] && day_s="day"
+    [[ $hours -eq 1 ]] && hour_s="hour"
+    [[ $minutes -eq 1 ]] && min_s="minute"
+
+    if [[ $days -gt 0 ]]; then
+        [[ $hours -gt 0 ]] && echo "${days} ${day_s} and ${hours} ${hour_s}" || echo "${days} ${day_s}"
+    elif [[ $hours -gt 0 ]]; then
+        [[ $minutes -gt 0 ]] && echo "${hours} ${hour_s} and ${minutes} ${min_s}" || echo "${hours} ${hour_s}"
+    else
+        echo "${minutes} ${min_s}"
+    fi
+}
+
+# Return ANSI color for a utilization percentage (green=lots left, red=almost full)
+usage_color() {
+    local percent="$1"
+    if [[ $percent -ge 80 ]]; then
+        printf '%s' "$C_RED"
+    elif [[ $percent -ge 50 ]]; then
+        printf '%s' "$C_YELLOW"
+    else
+        printf '%s' "$C_GREEN"
+    fi
+}
+
+# Render a 50-char wide text progress bar with optional color
+draw_progress_bar() {
+    local percent="$1"
+    local color="${2:-}"
+    local width=50
+    local filled=$(( percent * width / 100 ))
+    [[ $filled -gt $width ]] && filled=$width
+    [[ $filled -lt 0 ]] && filled=0
+
+    local bar="" i
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=filled; i<width; i++)); do bar+=" "; done
+    printf "    %s%s%s  %d%% used\n" "$color" "$bar" "$C_RESET" "$percent"
+}
+
+# Fetch usage stats from the Anthropic API using stored credentials.
+# Auto-refreshes expired access tokens using the stored refresh token.
+# Pass account_num + email for inactive accounts so refreshed tokens are
+# written back to the backup (Anthropic rotates refresh tokens on each use).
+fetch_account_usage() {
+    local creds_json="$1"
+    local account_num="${2:-}"
+    local email="${3:-}"
+
+    local access_token expires_at
+    access_token=$(echo "$creds_json" | jq -r '.claudeAiOauth.accessToken // empty')
+    expires_at=$(echo "$creds_json" | jq -r '.claudeAiOauth.expiresAt // 0')
+
+    [[ -z "$access_token" ]] && return 1
+
+    # expiresAt is in milliseconds; refresh if expired using claude CLI
+    local now_ms=$(( $(date +%s) * 1000 ))
+    if [[ "$expires_at" -le "$now_ms" && -n "$account_num" && -n "$email" ]]; then
+        # Cloudflare blocks curl/wget/python/node from the refresh endpoint
+        # (TLS fingerprint detection). Use claude CLI which passes through.
+        # Temporarily swap credentials + config, let claude refresh, restore.
+        local config_path
+        config_path=$(get_claude_config_path)
+        local orig_creds="" orig_config=""
+        [[ -f "$HOME/.claude/.credentials.json" ]] && orig_creds=$(cat "$HOME/.claude/.credentials.json")
+        [[ -f "$config_path" ]] && orig_config=$(cat "$config_path")
+
+        # Swap in target account's credentials
+        mkdir -p "$HOME/.claude"
+        printf '%s' "$creds_json" > "$HOME/.claude/.credentials.json"
+        chmod 600 "$HOME/.claude/.credentials.json"
+
+        # Swap in target account's oauthAccount config section
+        local target_config
+        target_config=$(read_account_config "$account_num" "$email")
+        if [[ -n "$target_config" && -n "$orig_config" ]]; then
+            local oauth_section merged
+            oauth_section=$(echo "$target_config" | jq '.oauthAccount' 2>/dev/null)
+            if [[ -n "$oauth_section" && "$oauth_section" != "null" ]]; then
+                merged=$(echo "$orig_config" | jq --argjson oauth "$oauth_section" '.oauthAccount = $oauth' 2>/dev/null)
+                [[ -n "$merged" ]] && write_json "$config_path" "$merged"
+            fi
+        fi
+
+        # claude auth status triggers internal token refresh via Bun runtime
+        claude auth status >/dev/null 2>&1
+
+        # Read back refreshed credentials and save to backup
+        if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+            local refreshed_creds new_expiry
+            refreshed_creds=$(cat "$HOME/.claude/.credentials.json")
+            new_expiry=$(echo "$refreshed_creds" | jq -r '.claudeAiOauth.expiresAt // 0')
+            if [[ "$new_expiry" -gt "$now_ms" ]]; then
+                access_token=$(echo "$refreshed_creds" | jq -r '.claudeAiOauth.accessToken // empty')
+                write_account_credentials "$account_num" "$email" "$refreshed_creds"
+            fi
+        fi
+
+        # Restore original credentials and config
+        if [[ -n "$orig_creds" ]]; then
+            printf '%s' "$orig_creds" > "$HOME/.claude/.credentials.json"
+            chmod 600 "$HOME/.claude/.credentials.json"
+        fi
+        if [[ -n "$orig_config" ]]; then
+            write_json "$config_path" "$orig_config"
+        fi
+    fi
+
+    local claude_version
+    claude_version=$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "2.0.0")
+
+    curl -s \
+        --max-time 10 \
+        -H "Authorization: Bearer $access_token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        -H "Content-Type: application/json" \
+        -H "User-Agent: claude-code/${claude_version}" \
+        "https://api.anthropic.com/api/oauth/usage" 2>/dev/null
+}
+
+# Display usage stats for one account
+display_account_usage() {
+    local account_num="$1"
+    local email="$2"
+    local is_active="$3"
+    local usage_json="$4"
+    local now
+    now=$(date +%s)
+
+    # Parse weekly usage early to color the header
+    local five_util five_reset five_percent="" seven_util_early seven_percent=""
+    five_util=$(echo "$usage_json" | jq -r '.five_hour.utilization // empty' 2>/dev/null)
+    five_reset=$(echo "$usage_json" | jq -r '.five_hour.resets_at // empty' 2>/dev/null)
+    [[ -n "$five_util" ]] && five_percent=$(echo "$five_util" | jq '. | round')
+    seven_util_early=$(echo "$usage_json" | jq -r '.seven_day.utilization // empty' 2>/dev/null)
+    [[ -n "$seven_util_early" ]] && seven_percent=$(echo "$seven_util_early" | jq '. | round')
+
+    # Color the account header based on weekly utilization
+    local hdr_color=""
+    [[ -n "$seven_percent" ]] && hdr_color=$(usage_color "$seven_percent")
+
+    if [[ "$is_active" == "true" ]]; then
+        printf "\n  %s%sAccount %s: %s (active)%s\n" "$hdr_color" "$C_BOLD" "$account_num" "$email" "$C_RESET"
+    else
+        printf "\n  %s%sAccount %s: %s%s\n" "$hdr_color" "$C_BOLD" "$account_num" "$email" "$C_RESET"
+    fi
+
+    if [[ -z "$usage_json" ]]; then
+        printf "    No credentials available\n"
+        return
+    fi
+
+    if jq -e '.error' <<<"$usage_json" >/dev/null 2>&1; then
+        local err_msg
+        err_msg=$(echo "$usage_json" | jq -r '.error.message // "unknown error"' 2>/dev/null)
+        printf "    %sUnable to fetch usage: %s%s\n" "$C_DIM" "$err_msg" "$C_RESET"
+        return
+    fi
+
+    printf "\n    Current session\n"
+    if [[ -n "$five_percent" ]]; then
+        local color reset_epoch secs_left
+        color=$(usage_color "$five_percent")
+        draw_progress_bar "$five_percent" "$color"
+        if [[ -n "$five_reset" ]]; then
+            reset_epoch=$(parse_iso_to_epoch "$five_reset")
+            secs_left=$(( reset_epoch - now ))
+            if [[ $secs_left -gt 0 ]]; then
+                printf "    %sResets in %s%s\n" "$C_DIM" "$(format_time_remaining "$secs_left")" "$C_RESET"
+            else
+                printf "    Resetting now\n"
+            fi
+        fi
+    else
+        printf "    N/A\n"
+    fi
+
+    # Seven-day window
+    local seven_util seven_reset
+    seven_util=$(echo "$usage_json" | jq -r '.seven_day.utilization // empty')
+    seven_reset=$(echo "$usage_json" | jq -r '.seven_day.resets_at // empty')
+
+    printf "\n    Current week (all models)\n"
+    if [[ -n "$seven_util" ]]; then
+        local percent color reset_epoch secs_left
+        percent=$(echo "$seven_util" | jq '. | round')
+        color=$(usage_color "$percent")
+        draw_progress_bar "$percent" "$color"
+        if [[ -n "$seven_reset" ]]; then
+            reset_epoch=$(parse_iso_to_epoch "$seven_reset")
+            secs_left=$(( reset_epoch - now ))
+            if [[ $secs_left -gt 0 ]]; then
+                printf "    %sResets in %s%s\n" "$C_DIM" "$(format_time_remaining "$secs_left")" "$C_RESET"
+            else
+                printf "    Resetting now\n"
+            fi
+        fi
+    else
+        printf "    N/A\n"
+    fi
+}
+
+# Show usage stats for all managed accounts
+cmd_usage() {
+    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+        echo "No accounts are managed yet."
+        exit 1
+    fi
+
+    local current_email
+    current_email=$(get_current_account)
+
+    local sequence
+    sequence=($(jq -r '.sequence[]' "$SEQUENCE_FILE"))
+
+    if [[ ${#sequence[@]} -eq 0 ]]; then
+        echo "No accounts in sequence."
+        exit 0
+    fi
+
+    printf "Usage Statistics:  %sgreen = use this%s · %syellow = moderate%s · %sred = almost full%s  (by weekly usage)\n" \
+        "$C_GREEN" "$C_RESET" "$C_YELLOW" "$C_RESET" "$C_RED" "$C_RESET"
+
+    local now
+    now=$(date +%s)
+
+    # urgency_entries collects "SCORE|account_num|email|remaining|hours_left" for recommendation
+    local -a urgency_entries=()
+
+    for account_num in "${sequence[@]}"; do
+        local email is_active creds usage_json
+        email=$(jq -r --arg num "$account_num" '.accounts[$num].email' "$SEQUENCE_FILE")
+        is_active="false"
+        [[ "$email" == "$current_email" ]] && is_active="true"
+
+        # For the active account, prefer live credentials (may have been auto-refreshed)
+        if [[ "$is_active" == "true" ]]; then
+            creds=$(read_credentials)
+            [[ -z "$creds" ]] && creds=$(read_account_credentials "$account_num" "$email")
+        else
+            creds=$(read_account_credentials "$account_num" "$email")
+        fi
+
+        if [[ -n "$creds" ]]; then
+            # Pass account_num+email for inactive accounts so refreshed tokens
+            # are written back to the backup (active account is managed by Claude Code)
+            if [[ "$is_active" == "true" ]]; then
+                usage_json=$(fetch_account_usage "$creds")
+            else
+                usage_json=$(fetch_account_usage "$creds" "$account_num" "$email")
+            fi
+        else
+            usage_json=""
+        fi
+
+        display_account_usage "$account_num" "$email" "$is_active" "$usage_json"
+
+        # Compute urgency score: (weekly % remaining) / (hours to reset)
+        # Higher = more capacity expiring sooner = use this account now
+        if [[ -n "$usage_json" ]] && ! jq -e '.error' <<<"$usage_json" >/dev/null 2>&1; then
+            local s_util s_reset
+            s_util=$(echo "$usage_json" | jq -r '.seven_day.utilization // empty')
+            s_reset=$(echo "$usage_json" | jq -r '.seven_day.resets_at // empty')
+            if [[ -n "$s_util" && -n "$s_reset" ]]; then
+                local remaining reset_ep hours_left score
+                remaining=$(echo "$s_util" | jq '(100 - (. | round)) | if . < 0 then 0 else . end')
+                reset_ep=$(parse_iso_to_epoch "$s_reset")
+                hours_left=$(( (reset_ep - now) / 3600 ))
+                [[ $hours_left -lt 1 ]] && hours_left=1
+                score=$(( remaining * 1000 / hours_left ))
+                urgency_entries+=("$(printf '%07d|%s|%s|%s|%s' "$score" "$account_num" "$email" "$remaining" "$hours_left")")
+            fi
+        fi
+    done
+
+    # Show recommendation sorted by urgency (highest first)
+    if [[ ${#urgency_entries[@]} -gt 0 ]]; then
+        printf "\n  %s→ Use in this order:%s\n" "$C_BOLD" "$C_RESET"
+        local rank=1
+        while IFS='|' read -r score acc em remaining hours_left; do
+            local color
+            color=$(usage_color "$(( 100 - remaining ))")
+            printf "    %s%d. Account %s (%s)%s  —  %d%% weekly left, resets in %s\n" \
+                "$color" "$rank" "$acc" "$em" "$C_RESET" \
+                "$remaining" "$(format_time_remaining $(( hours_left * 3600 )))"
+            (( rank++ ))
+        done < <(printf '%s\n' "${urgency_entries[@]}" | sort -t'|' -k1 -rn -k2 -n)
+    fi
+
+    printf "\n"
+}
+
+# Switch to the highest-urgency account that still has 5-hour session capacity
+cmd_switch_best() {
+    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+        echo "Error: No accounts are managed yet"
+        exit 1
+    fi
+
+    local current_email
+    current_email=$(get_current_account)
+
+    local sequence
+    sequence=($(jq -r '.sequence[]' "$SEQUENCE_FILE"))
+
+    if [[ ${#sequence[@]} -le 1 ]]; then
+        echo "Error: Need at least 2 managed accounts to switch"
+        exit 1
+    fi
+
+    local now
+    now=$(date +%s)
+
+    # Find active account number
+    local active_num=""
+    if [[ "$current_email" != "none" ]]; then
+        active_num=$(jq -r --arg email "$current_email" \
+            '.accounts | to_entries[] | select(.value.email == $email) | .key' \
+            "$SEQUENCE_FILE" 2>/dev/null)
+    fi
+
+    echo "Checking accounts..."
+
+    local best_account="" best_email="" best_score=-1 best_remaining=0 best_hours=0
+
+    for account_num in "${sequence[@]}"; do
+        local email
+        email=$(jq -r --arg num "$account_num" '.accounts[$num].email' "$SEQUENCE_FILE")
+
+        local is_active=false
+        [[ "$account_num" == "$active_num" ]] && is_active=true
+
+        # Use live credentials for active account, backup for others
+        local creds
+        if $is_active; then
+            creds=$(read_credentials)
+        else
+            creds=$(read_account_credentials "$account_num" "$email")
+        fi
+        if [[ -z "$creds" ]]; then
+            printf "  Account %s (%s): no credentials\n" "$account_num" "$email"
+            continue
+        fi
+
+        local usage_json
+        if $is_active; then
+            usage_json=$(fetch_account_usage "$creds")
+        else
+            usage_json=$(fetch_account_usage "$creds" "$account_num" "$email")
+        fi
+
+        if [[ -z "$usage_json" ]] || jq -e '.error' <<<"$usage_json" >/dev/null 2>&1; then
+            local err
+            err=$(echo "$usage_json" | jq -r '.error.message // "unavailable"' 2>/dev/null)
+            printf "  Account %s (%s): %s\n" "$account_num" "$email" "$err"
+            continue
+        fi
+
+        # Skip accounts with no 5-hour session capacity left
+        local five_util five_percent
+        five_util=$(echo "$usage_json" | jq -r '.five_hour.utilization // empty')
+        five_percent=0
+        [[ -n "$five_util" ]] && five_percent=$(echo "$five_util" | jq '. | round')
+        if [[ $five_percent -ge 99 ]]; then
+            printf "  Account %s (%s): 5h session full (%d%% used), skipping\n" \
+                "$account_num" "$email" "$five_percent"
+            continue
+        fi
+
+        # Compute urgency: weekly remaining / hours to reset
+        local s_util s_reset remaining hours_left score
+        s_util=$(echo "$usage_json" | jq -r '.seven_day.utilization // empty')
+        s_reset=$(echo "$usage_json" | jq -r '.seven_day.resets_at // empty')
+        remaining=0; hours_left=1; score=0
+        if [[ -n "$s_util" && -n "$s_reset" ]]; then
+            remaining=$(echo "$s_util" | jq '(100 - (. | round)) | if . < 0 then 0 else . end')
+            local reset_ep
+            reset_ep=$(parse_iso_to_epoch "$s_reset")
+            hours_left=$(( (reset_ep - now) / 3600 ))
+            [[ $hours_left -lt 1 ]] && hours_left=1
+            score=$(( remaining * 1000 / hours_left ))
+        fi
+
+        if $is_active; then
+            printf "  Account %s (%s): %d%% session used, %d%% weekly left (active)\n" \
+                "$account_num" "$email" "$five_percent" "$remaining"
+        else
+            printf "  Account %s (%s): %d%% session used, %d%% weekly left\n" \
+                "$account_num" "$email" "$five_percent" "$remaining"
+        fi
+
+        # Prefer higher score; on a tie, prefer non-active account over active
+        local prefer=false
+        if [[ $score -gt $best_score ]]; then
+            prefer=true
+        elif [[ $score -eq $best_score && "$best_account" == "$active_num" && "$account_num" != "$active_num" ]]; then
+            prefer=true
+        fi
+        if $prefer; then
+            best_score=$score
+            best_account=$account_num
+            best_email=$email
+            best_remaining=$remaining
+            best_hours=$hours_left
+        fi
+    done
+
+    if [[ -z "$best_account" ]]; then
+        echo "No accounts available with 5-hour session capacity. Try again after a reset."
+        exit 1
+    fi
+
+    if [[ "$best_account" == "$active_num" ]]; then
+        printf "\nAlready on the best account — Account %s (%s), %d%% weekly left\n" \
+            "$best_account" "$best_email" "$best_remaining"
+        exit 0
+    fi
+
+    printf "\nSwitching to Account %s (%s) — %d%% weekly left, resets in %s\n" \
+        "$best_account" "$best_email" "$best_remaining" \
+        "$(format_time_remaining $(( best_hours * 3600 )))"
+
+    perform_switch "$best_account"
+}
+
 # Switch to next account
 cmd_switch() {
     if [[ ! -f "$SEQUENCE_FILE" ]]; then
@@ -688,6 +1152,8 @@ show_usage() {
     echo "  --add-account                    Add current account to managed accounts"
     echo "  --remove-account <num|email>    Remove account by number or email"
     echo "  --list                           List all managed accounts"
+    echo "  --usage                          Show usage stats for all managed accounts"
+    echo "  --switch-best                    Switch to best account with 5h session capacity"
     echo "  --switch                         Rotate to next account in sequence"
     echo "  --switch-to <num|email>          Switch to specific account number or email"
     echo "  --help                           Show this help message"
@@ -722,6 +1188,12 @@ main() {
             ;;
         --list)
             cmd_list
+            ;;
+        --usage)
+            cmd_usage
+            ;;
+        --switch-best)
+            cmd_switch_best
             ;;
         --switch)
             cmd_switch
