@@ -62,6 +62,53 @@ function Write-JsonSafe {
     Move-Item -Force -Path $tmp -Destination $Path
 }
 
+# ── Claude config JSON helpers (handles duplicate-key JSON like ~/.claude.json) ──
+# Extracts a named top-level block from a JSON string using brace counting.
+# Safer than ConvertFrom-Json when the file has duplicate keys.
+function Get-JsonBlock {
+    param([string]$Json, [string]$Key)
+    $keyStr = '"' + $Key + '"'
+    $keyPos = $Json.IndexOf($keyStr)
+    if ($keyPos -lt 0) { return "" }
+    $start = $Json.IndexOf('{', $Json.IndexOf(':', $keyPos + $keyStr.Length))
+    if ($start -lt 0) { return "" }
+    $depth = 0; $i = $start; $inStr = $false
+    while ($i -lt $Json.Length) {
+        $c = $Json[$i]
+        if ($inStr)  { if ($c -eq '\') { $i++ } elseif ($c -eq '"') { $inStr = $false } }
+        else         { if ($c -eq '"') { $inStr = $true } elseif ($c -eq '{') { $depth++ } elseif ($c -eq '}') { $depth--; if ($depth -eq 0) { break } } }
+        $i++
+    }
+    return $Json.Substring($start, $i - $start + 1)
+}
+
+# Replaces a named top-level block in a JSON string (same brace-counting logic).
+function Set-JsonBlock {
+    param([string]$Json, [string]$Key, [string]$Block)
+    $keyStr = '"' + $Key + '"'
+    $keyPos = $Json.IndexOf($keyStr)
+    if ($keyPos -lt 0) { return $Json }
+    $start = $Json.IndexOf('{', $Json.IndexOf(':', $keyPos + $keyStr.Length))
+    if ($start -lt 0) { return $Json }
+    $depth = 0; $i = $start; $inStr = $false
+    while ($i -lt $Json.Length) {
+        $c = $Json[$i]
+        if ($inStr)  { if ($c -eq '\') { $i++ } elseif ($c -eq '"') { $inStr = $false } }
+        else         { if ($c -eq '"') { $inStr = $true } elseif ($c -eq '{') { $depth++ } elseif ($c -eq '}') { $depth--; if ($depth -eq 0) { break } } }
+        $i++
+    }
+    return $Json.Substring(0, $start) + $Block + $Json.Substring($i + 1)
+}
+
+# Writes a raw JSON string to disk without a ConvertFrom-Json round-trip.
+# Use this for ~/.claude.json which may contain duplicate keys.
+function Write-RawJson {
+    param([string]$Path, [string]$Json)
+    $tmp = "$Path.tmp"
+    [System.IO.File]::WriteAllText($tmp, $Json, (New-Object System.Text.UTF8Encoding $true))
+    Move-Item -Force -Path $tmp -Destination $Path
+}
+
 # ── sequence.json ─────────────────────────────────────────────────────────────
 function Read-SequenceFile {
     if (-not (Test-Path $SequenceFile)) { return $null }
@@ -92,8 +139,12 @@ function Get-CurrentAccount {
     $p = Get-ClaudeConfigPath
     if (-not (Test-Path $p)) { return "none" }
     try {
-        $email = (Get-Content $p -Raw | ConvertFrom-Json).oauthAccount.emailAddress
-        if ($email) { return $email }
+        $raw   = [System.IO.File]::ReadAllText($p)
+        $block = Get-JsonBlock -Json $raw -Key "oauthAccount"
+        if ($block) {
+            $email = ($block | ConvertFrom-Json).emailAddress
+            if ($email) { return $email }
+        }
     } catch { }
     return "none"
 }
@@ -218,11 +269,10 @@ function Invoke-UsageApi {
 
         $targetConfig = Read-AccountConfig -Num $AccountNum -Email $Email
         if ($targetConfig -and $origConfig) {
-            try {
-                $tc = $targetConfig | ConvertFrom-Json; $oc = $origConfig | ConvertFrom-Json
-                $oc.oauthAccount = $tc.oauthAccount
-                Write-JsonSafe -Path $configPath -Content $oc
-            } catch { }
+            $tgtOauth = Get-JsonBlock -Json $targetConfig -Key "oauthAccount"
+            if ($tgtOauth) {
+                Write-RawJson -Path $configPath -Json (Set-JsonBlock -Json $origConfig -Key "oauthAccount" -Block $tgtOauth)
+            }
         }
 
         & claude auth status 2>&1 | Out-Null
@@ -238,9 +288,7 @@ function Invoke-UsageApi {
         }
 
         if ($origCreds) { Write-Credentials -Creds $origCreds }
-        if ($origConfig) {
-            try { Write-JsonSafe -Path $configPath -Content ($origConfig | ConvertFrom-Json) } catch { }
-        }
+        if ($origConfig) { Write-RawJson -Path $configPath -Json $origConfig }
     }
 
     $ver = "2.0.0"
@@ -318,16 +366,16 @@ function Invoke-AddAccount {
     $creds       = Read-Credentials
     if (-not $creds) { Write-Host "Error: No credentials found for current account" -ForegroundColor Red; exit 1 }
     $configPath  = Get-ClaudeConfigPath
-    $config      = Get-Content $configPath -Raw
-    $uuid        = ($config | ConvertFrom-Json).oauthAccount.accountUuid
+    $config      = [System.IO.File]::ReadAllText($configPath)
+    $oauthBlock  = Get-JsonBlock -Json $config -Key "oauthAccount"
+    $uuid        = if ($oauthBlock) { try { ($oauthBlock | ConvertFrom-Json).accountUuid } catch { "" } } else { "" }
 
     Write-AccountCredentials -Num $num -Email $email -Creds $creds
     Write-AccountConfig      -Num $num -Email $email -Config $config
 
     $seq = Read-SequenceFile
-    $seq.accounts | Add-Member -NotePropertyName "$num" -NotePropertyValue ([PSCustomObject]@{
-        email = $email; uuid = $uuid; added = Get-UtcNow
-    }) -Force
+    $acctVal = [PSCustomObject]@{ email = $email; uuid = $uuid; added = Get-UtcNow }
+    $seq.accounts.PSObject.Properties.Add((New-Object System.Management.Automation.PSNoteProperty("$num", $acctVal)))
     $seq.sequence            = @($seq.sequence) + @([int]$num)
     $seq.activeAccountNumber = [int]$num
     $seq.lastUpdated         = Get-UtcNow
@@ -553,7 +601,7 @@ function Invoke-PerformSwitch {
 
     # Backup current
     $curCreds  = Read-Credentials
-    $curConfig = Get-Content $configPath -Raw
+    $curConfig = [System.IO.File]::ReadAllText($configPath)
     Write-AccountCredentials -Num $currentNum  -Email $currentEmail -Creds $curCreds
     Write-AccountConfig      -Num $currentNum  -Email $currentEmail -Config $curConfig
 
@@ -566,12 +614,10 @@ function Invoke-PerformSwitch {
 
     # Activate
     Write-Credentials -Creds $tgtCreds
-    $tc = $tgtConfig | ConvertFrom-Json
-    if (-not $tc.oauthAccount) { Write-Host "Error: Invalid oauthAccount in backup" -ForegroundColor Red; exit 1 }
+    $tgtOauth = Get-JsonBlock -Json $tgtConfig -Key "oauthAccount"
+    if (-not $tgtOauth) { Write-Host "Error: Invalid oauthAccount in backup" -ForegroundColor Red; exit 1 }
 
-    $cc = $curConfig | ConvertFrom-Json
-    $cc.oauthAccount = $tc.oauthAccount
-    Write-JsonSafe -Path $configPath -Content $cc
+    Write-RawJson -Path $configPath -Json (Set-JsonBlock -Json $curConfig -Key "oauthAccount" -Block $tgtOauth)
 
     # Update state
     $seq.activeAccountNumber = [int]$Target
