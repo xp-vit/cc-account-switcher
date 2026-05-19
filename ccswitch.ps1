@@ -1,4 +1,4 @@
-# ccswitch.ps1 - Multi-Account Switcher for Claude Code (Windows)
+﻿# ccswitch.ps1 - Multi-Account Switcher for Claude Code (Windows)
 # PowerShell 5.1+  |  No external dependencies
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -291,8 +291,7 @@ function Show-AccountUsage {
         Write-ProgressBar -Pct $f5Pct -Color (Get-UsageColor -Pct $f5Pct)
         if ($f5Reset) {
             $secs = (ConvertTo-UnixEpoch $f5Reset) - $now
-            if ($secs -gt 0) { Write-Host ("    {0}Resets in {1}{2}" -f $C_DIM, (Format-TimeRemaining $secs), $C_RESET) }
-            else              { Write-Host "    Resetting now" }
+            if ($secs -gt 0) { Write-Host ("    {0}Resets in {1}{2}" -f $C_DIM, (Format-TimeRemaining $secs), $C_RESET) } else { Write-Host "    Resetting now" }
         }
     } else { Write-Host "    N/A" }
 
@@ -303,8 +302,7 @@ function Show-AccountUsage {
         Write-ProgressBar -Pct $s7Pct -Color (Get-UsageColor -Pct $s7Pct)
         if ($s7Reset) {
             $secs = (ConvertTo-UnixEpoch $s7Reset) - $now
-            if ($secs -gt 0) { Write-Host ("    {0}Resets in {1}{2}" -f $C_DIM, (Format-TimeRemaining $secs), $C_RESET) }
-            else              { Write-Host "    Resetting now" }
+            if ($secs -gt 0) { Write-Host ("    {0}Resets in {1}{2}" -f $C_DIM, (Format-TimeRemaining $secs), $C_RESET) } else { Write-Host "    Resetting now" }
         }
     } else { Write-Host "    N/A" }
 }
@@ -413,8 +411,12 @@ function Invoke-Usage {
     foreach ($n in $sequence) {
         $email    = $seq.accounts.PSObject.Properties["$n"].Value.email
         $isActive = ($email -eq $currentEmail)
-        $creds    = if ($isActive) { $live = Read-Credentials; if ($live) {$live} else {Read-AccountCredentials "$n" $email} }
-                    else           { Read-AccountCredentials "$n" $email }
+        if ($isActive) {
+            $live  = Read-Credentials
+            $creds = if ($live) { $live } else { Read-AccountCredentials "$n" $email }
+        } else {
+            $creds = Read-AccountCredentials "$n" $email
+        }
         $data     = if ($creds) {
             if ($isActive) { Invoke-UsageApi $creds } else { Invoke-UsageApi $creds "$n" $email }
         } else { $null }
@@ -534,7 +536,7 @@ function Invoke-SwitchTo {
 
     $target = Resolve-AccountIdentifier $Identifier
     if (-not $target) { Write-Host "Error: No account found: $Identifier" -ForegroundColor Red; exit 1 }
-    if (-not $seq) { $seq = Read-SequenceFile }
+    $seq = Read-SequenceFile
     if (-not $seq.accounts.PSObject.Properties[$target]) {
         Write-Host "Error: Account-$target does not exist" -ForegroundColor Red; exit 1
     }
