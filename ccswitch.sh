@@ -643,8 +643,12 @@ fetch_account_usage() {
             fi
         fi
 
-        # claude auth status triggers internal token refresh via Bun runtime
-        claude auth status >/dev/null 2>&1
+        # A minimal headless query forces a real OAuth token refresh via the
+        # stored refresh token. NOTE: `claude auth status` only READS cached
+        # state and never refreshes — it was a silent no-op here, leaving
+        # inactive tokens expired (401 "Invalid authentication credentials").
+        # `claude -p` actually re-authenticates and rotates the tokens.
+        claude -p "ok" >/dev/null 2>&1
 
         # Read back refreshed credentials and save to backup
         if [[ -f "$HOME/.claude/.credentials.json" ]]; then
@@ -815,6 +819,9 @@ cmd_usage() {
         fi
 
         display_account_usage "$account_num" "$email" "$is_active" "$usage_json"
+
+        # Throttle: the usage API 429s on rapid sequential calls across accounts.
+        sleep 2
 
         # Compute urgency score: (weekly % remaining) / (hours to reset)
         # Higher = more capacity expiring sooner = use this account now
