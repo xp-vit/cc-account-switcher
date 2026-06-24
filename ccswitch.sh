@@ -50,7 +50,7 @@ is_running_in_container() {
 detect_platform() {
     case "$(uname -s)" in
         Darwin) echo "macos" ;;
-        Linux) 
+        Linux)
             if [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
                 echo "wsl"
             else
@@ -224,7 +224,7 @@ write_credentials() {
     local credentials="$1"
     local platform
     platform=$(detect_platform)
-    
+
     case "$platform" in
         macos)
             security add-generic-password -U -s "Claude Code-credentials" -a "$USER" -w "$credentials" 2>/dev/null
@@ -266,7 +266,7 @@ write_account_credentials() {
     local credentials="$3"
     local platform
     platform=$(detect_platform)
-    
+
     case "$platform" in
         macos)
             security add-generic-password -U -s "Claude Code-Account-${account_num}-${email}" -a "$USER" -w "$credentials" 2>/dev/null
@@ -1151,6 +1151,38 @@ perform_switch() {
 }
 
 # Show usage
+cmd_install_completion() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local comp_file="$script_dir/ccswitch.completion.bash"
+
+    if [[ ! -f "$comp_file" ]]; then
+        echo "Error: ccswitch.completion.bash not found next to ccswitch.sh"
+        exit 1
+    fi
+
+    local line="source \"$comp_file\""
+    local rc_file
+
+    # Pick the right rc file
+    if [[ -f "$HOME/.bashrc" ]]; then
+        rc_file="$HOME/.bashrc"
+    elif [[ -f "$HOME/.bash_profile" ]]; then
+        rc_file="$HOME/.bash_profile"
+    else
+        rc_file="$HOME/.bashrc"
+    fi
+
+    if grep -qF "$comp_file" "$rc_file" 2>/dev/null; then
+        echo "Completion already installed in $rc_file"
+        return
+    fi
+
+    printf '\n# ccswitch tab completion\n%s\n' "$line" >> "$rc_file"
+    echo "Installed completion in $rc_file"
+    echo "Restart your shell or run: $line"
+}
+
 show_usage() {
     echo "Multi-Account Switcher for Claude Code"
     echo "Usage: $0 [COMMAND]"
@@ -1163,6 +1195,7 @@ show_usage() {
     echo "  --switch-best                    Switch to best account with 5h session capacity"
     echo "  --switch                         Rotate to next account in sequence"
     echo "  --switch-to <num|email>          Switch to specific account number or email"
+    echo "  --install-completion             Install tab completion into shell rc file"
     echo "  --help                           Show this help message"
     echo ""
     echo "Examples:"
@@ -1208,6 +1241,9 @@ main() {
         --switch-to)
             shift
             cmd_switch_to "$@"
+            ;;
+        --install-completion)
+            cmd_install_completion
             ;;
         --help)
             show_usage
